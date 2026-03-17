@@ -3,15 +3,19 @@ import json
 import subprocess
 from dotenv import load_dotenv
 from openai import OpenAI
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Confirm
+from rich import print
 
 # -------------------------
-# Load environment variables
+# Setup
 # -------------------------
+
 load_dotenv()
 
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY")
-)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+console = Console()
 
 MAX_STEPS = 15
 
@@ -20,20 +24,11 @@ MAX_STEPS = 15
 # -------------------------
 
 BLOCKED_COMMANDS = [
-    "rm -rf",
-    "shutdown",
-    "reboot",
-    "mkfs",
-    ":(){:|:&};:"
+    "rm -rf", "shutdown", "reboot", "mkfs", ":(){:|:&};:"
 ]
 
-
 def is_safe_command(command: str):
-    for blocked in BLOCKED_COMMANDS:
-        if blocked in command:
-            return False
-    return True
-
+    return not any(b in command for b in BLOCKED_COMMANDS)
 
 # -------------------------
 # TOOLS
@@ -43,6 +38,10 @@ def run_command(command: str):
 
     if not is_safe_command(command):
         return {"error": "Blocked unsafe command"}
+
+    # 🔒 Ask user before executing
+    if not Confirm.ask(f"[yellow]Run command?[/yellow] [bold]{command}[/bold]"):
+        return {"error": "User skipped command"}
 
     try:
         result = subprocess.run(
@@ -61,27 +60,16 @@ def run_command(command: str):
     except Exception as e:
         return {"error": str(e)}
 
-
 def create_repo(repo_name: str):
-
-    command = f"gh repo create {repo_name} --public --source=. --push"
-
-    return run_command(command)
-
+    return run_command(f"gh repo create {repo_name} --public --source=. --push")
 
 # -------------------------
 # TOOL REGISTRY
 # -------------------------
 
 TOOLS = {
-    "run_command": {
-        "fn": run_command,
-        "description": "Execute terminal commands"
-    },
-    "create_repo": {
-        "fn": create_repo,
-        "description": "Create GitHub repository and push code"
-    }
+    "run_command": {"fn": run_command},
+    "create_repo": {"fn": create_repo}
 }
 
 # -------------------------
@@ -89,8 +77,13 @@ TOOLS = {
 # -------------------------
 
 SYSTEM_PROMPT = """
-You are an AI Assistent experties in the automating the github related any user query.
-You are best in pushing the code to github account. 
+You are a GitHub automation agent who is specialize in all the github related operations.
+
+You MUST ALWAYS respond in VALID JSON.
+
+Do NOT write explanations.
+Do NOT write text outside JSON.
+Do NOT include markdown or code blocks.
 
 You operate using these steps:
 
@@ -99,22 +92,22 @@ ACTION
 OBSERVE
 OUTPUT
 
-Rules:
-
-- Always PLAN before ACTION
-- Only call tools that are available
-- Wait for OBSERVE before continuing
-- Return ONLY ONE JSON object per response
-- Finish with OUTPUT
-
-Output JSON format:
+Allowed format:
 
 {
- "step":"plan | action | observe | output",
- "content":"reasoning",
- "function":"tool_name_if_action",
- "input":"tool_input"
+ "step": "plan | action | observe | output",
+ "content": "text",
+ "function": "tool_name_if_action",
+ "input": "command"
 }
+
+Rules:
+- Only ONE JSON object per response
+- No extra text before or after JSON
+- No markdown (no ```json)
+- If you fail format, system will break
+
+You are controlling a real terminal. Be precise.
 
 Available tools:
 
@@ -122,15 +115,23 @@ run_command
 create_repo
 """
 
+messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
 # -------------------------
-# Agent memory
+# Helper UI functions
 # -------------------------
 
-messages = [
-    {"role": "system", "content": SYSTEM_PROMPT}
-]
+def show_plan(text):
+    console.print(Panel(f"[cyan]{text}[/cyan]", title="🧠 Plan"))
 
-memory = []
+def show_action(cmd):
+    console.print(f"[yellow]⚙️ Running:[/yellow] [bold]{cmd}[/bold]")
+
+def show_success(msg="Done"):
+    console.print(f"[green]✅ {msg}[/green]")
+
+def show_error(msg):
+    console.print(f"[red]❌ {msg}[/red]")
 
 # -------------------------
 # AGENT LOOP
@@ -140,9 +141,7 @@ def run_agent(user_query):
 
     messages.append({"role": "user", "content": user_query})
 
-    for step in range(MAX_STEPS):
-
-        print(f"\n--- Step {step+1} ---")
+    for _ in range(MAX_STEPS):
 
         response = client.chat.completions.create(
             model="gpt-4o",
@@ -154,7 +153,7 @@ def run_agent(user_query):
         try:
             parsed = json.loads(content)
         except Exception:
-            print("❌ Invalid JSON returned by model:")
+            show_error("Invalid JSON from model")
             print(content)
             break
 
@@ -168,42 +167,41 @@ def run_agent(user_query):
         # -------------------------
         # PLAN
         # -------------------------
-
         if step_type == "plan":
-
-            print("🧠 PLAN:", parsed.get("content"))
+            show_plan(parsed.get("content"))
             continue
 
         # -------------------------
         # ACTION
         # -------------------------
-
         if step_type == "action":
 
             tool_name = parsed.get("function")
             tool_input = parsed.get("input")
 
-            print(f"⚙️ ACTION: {tool_name} -> {tool_input}")
+            show_action(tool_input)
 
             tool = TOOLS.get(tool_name)
 
             if not tool:
                 observation = {"error": "Tool not found"}
+                show_error("Tool not found")
             else:
                 observation = tool["fn"](tool_input)
 
-            memory.append(observation)
-
-            print("👀 OBSERVE:", observation)
-
-            observe_msg = {
-                "step": "observe",
-                "output": observation
-            }
+            if observation.get("returncode") == 0:
+                show_success()
+            elif observation.get("error"):
+                show_error(observation.get("error"))
+            else:
+                show_error("Command failed")
 
             messages.append({
                 "role": "assistant",
-                "content": json.dumps(observe_msg)
+                "content": json.dumps({
+                    "step": "observe",
+                    "output": observation
+                })
             })
 
             continue
@@ -211,12 +209,14 @@ def run_agent(user_query):
         # -------------------------
         # OUTPUT
         # -------------------------
-
         if step_type == "output":
-
-            print("\n✅ RESULT:", parsed.get("content"))
+            console.print(
+                Panel(
+                    f"[bold green]{parsed.get('content')}[/bold green]",
+                    title="🎉 Result"
+                )
+            )
             break
-
 
 # -------------------------
 # CLI
@@ -224,15 +224,13 @@ def run_agent(user_query):
 
 if __name__ == "__main__":
 
-    print("\n🚀 GitHub Automation Agent Ready")
-    print("Type 'exit' to quit\n")
+    console.print("[bold green]🚀 GitHub Agent Ready[/bold green]")
 
     while True:
-
-        query = input("> ")
+        query = input("\n> ")
 
         if query.lower() == "exit":
-            print("Bye!")
+            print("Bye 👋")
             break
 
         run_agent(query)

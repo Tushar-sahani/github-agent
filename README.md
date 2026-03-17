@@ -2,20 +2,21 @@
 
 ## Description
 
-A brief description of the project.
-
-## Installation
-
-Instructions on installing the project.
+This project is designed to...
 
 ## Usage
 
-Instructions on using the project.
+To use this project, follow these steps...
 
-## Contributing
+## Tools Required
 
-Guidelines for contributing.
+- Tool 1
+- Tool 2
 
-## License
+## Installation
 
-Details about the license.
+Instructions to install...
+
+## Contribution
+
+Guidelines for contribution...

@@ -1,12 +1,12 @@
 import os
 import json
 import subprocess
+import re
 from dotenv import load_dotenv
 from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm
-from rich import print
 
 # -------------------------
 # Setup
@@ -31,6 +31,64 @@ def is_safe_command(command: str):
     return not any(b in command for b in BLOCKED_COMMANDS)
 
 # -------------------------
+# Smart command approval
+# -------------------------
+
+AUTO_APPROVE = [
+    "git add",
+    "git commit",
+    "git status",
+    "git branch",
+    "git checkout"
+]
+
+CONFIRM_REQUIRED = [
+    "git push",
+    "git push --force",
+    "gh repo create"
+]
+
+def should_auto(cmd):
+    return any(cmd.startswith(p) for p in AUTO_APPROVE)
+
+def should_confirm(cmd):
+    return any(p in cmd for p in CONFIRM_REQUIRED)
+
+# -------------------------
+# Commit message generator
+# -------------------------
+
+def generate_commit_message():
+    diff = subprocess.run(
+        "git diff --staged",
+        shell=True,
+        capture_output=True,
+        text=True
+    ).stdout[:3000]
+
+    if not diff.strip():
+        return "chore: update project files"
+
+    prompt = f"""
+    Generate a professional git commit message.
+
+    Rules:
+    - Use conventional commit style (feat, fix, refactor, chore)
+    - Keep it concise and meaningful
+    - 1 line summary only
+
+    Diff:
+    {diff}
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return response.choices[0].message.content.strip()
+
+# -------------------------
 # TOOLS
 # -------------------------
 
@@ -39,9 +97,10 @@ def run_command(command: str):
     if not is_safe_command(command):
         return {"error": "Blocked unsafe command"}
 
-    # 🔒 Ask user before executing
-    if not Confirm.ask(f"[yellow]Run command?[/yellow] [bold]{command}[/bold]"):
-        return {"error": "User skipped command"}
+    # ✅ Auto approve safe commands
+    if not should_auto(command) and should_confirm(command):
+        if not Confirm.ask(f"[yellow]Confirm:[/yellow] [bold]{command}[/bold]"):
+            return {"error": "User skipped command"}
 
     try:
         result = subprocess.run(
@@ -63,10 +122,6 @@ def run_command(command: str):
 def create_repo(repo_name: str):
     return run_command(f"gh repo create {repo_name} --public --source=. --push")
 
-# -------------------------
-# TOOL REGISTRY
-# -------------------------
-
 TOOLS = {
     "run_command": {"fn": run_command},
     "create_repo": {"fn": create_repo}
@@ -77,22 +132,14 @@ TOOLS = {
 # -------------------------
 
 SYSTEM_PROMPT = """
-You are a GitHub automation agent who is specialize in all the github related operations.
+You are a strict JSON-only GitHub automation agent.
 
 You MUST ALWAYS respond in VALID JSON.
 
 Do NOT write explanations.
 Do NOT write text outside JSON.
-Do NOT include markdown or code blocks.
 
-You operate using these steps:
-
-PLAN
-ACTION
-OBSERVE
-OUTPUT
-
-Allowed format:
+Format:
 
 {
  "step": "plan | action | observe | output",
@@ -102,15 +149,11 @@ Allowed format:
 }
 
 Rules:
-- Only ONE JSON object per response
-- No extra text before or after JSON
-- No markdown (no ```json)
-- If you fail format, system will break
+- One JSON only
+- No markdown
+- Be precise
 
-You are controlling a real terminal. Be precise.
-
-Available tools:
-
+Tools:
 run_command
 create_repo
 """
@@ -118,14 +161,27 @@ create_repo
 messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
 # -------------------------
-# Helper UI functions
+# JSON extractor (robust)
+# -------------------------
+
+def extract_json(text):
+    try:
+        return json.loads(text)
+    except:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        raise Exception("Invalid JSON")
+
+# -------------------------
+# UI helpers
 # -------------------------
 
 def show_plan(text):
     console.print(Panel(f"[cyan]{text}[/cyan]", title="🧠 Plan"))
 
 def show_action(cmd):
-    console.print(f"[yellow]⚙️ Running:[/yellow] [bold]{cmd}[/bold]")
+    console.print(f"[yellow]⚙️[/yellow] [bold]{cmd}[/bold]")
 
 def show_success(msg="Done"):
     console.print(f"[green]✅ {msg}[/green]")
@@ -151,7 +207,7 @@ def run_agent(user_query):
         content = response.choices[0].message.content.strip()
 
         try:
-            parsed = json.loads(content)
+            parsed = extract_json(content)
         except Exception:
             show_error("Invalid JSON from model")
             print(content)
@@ -179,6 +235,12 @@ def run_agent(user_query):
             tool_name = parsed.get("function")
             tool_input = parsed.get("input")
 
+            # 🔥 Smart commit message injection
+            if tool_input.startswith("git commit"):
+                console.print("[cyan]🧠 Generating commit message...[/cyan]")
+                msg = generate_commit_message()
+                tool_input = f'git commit -m "{msg}"'
+
             show_action(tool_input)
 
             tool = TOOLS.get(tool_name)
@@ -188,6 +250,12 @@ def run_agent(user_query):
                 show_error("Tool not found")
             else:
                 observation = tool["fn"](tool_input)
+
+            # 🔁 Retry push if failed
+            if observation.get("returncode") != 0 and "git push" in tool_input:
+                console.print("[yellow]⚠️ Retrying push with upstream...[/yellow]")
+                retry_cmd = "git push --set-upstream origin $(git branch --show-current)"
+                observation = run_command(retry_cmd)
 
             if observation.get("returncode") == 0:
                 show_success()
